@@ -248,3 +248,117 @@ jobs:
           name: semgrep-results-${{ github.actor }}
           path: results/
           retention-days: 30
+      # ===================================================
+      # STEP 9: Export CSV
+      # ===================================================
+      - name: Export CSV
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import json, glob, os, csv
+
+          RESULTS_DIR = "results"
+
+          # Load LOC data
+          loc_data = {}
+          try:
+            with open(f"{RESULTS_DIR}/loc_summary.json") as f:
+              loc_data = json.load(f)
+          except:
+            print("⚠️  loc_summary.json not found")
+
+          # --- SAST CSV ---
+          sast_rows = []
+          for f in sorted(glob.glob(f"{RESULTS_DIR}/v*_sast.json")):
+            version = os.path.basename(f).replace("_sast.json", "")
+            try:
+              d = json.load(open(f))
+              for r in d.get("results", []):
+                sast_rows.append({
+                  "version":  version,
+                  "rule_id":  r.get("check_id", ""),
+                  "severity": r.get("extra", {}).get("severity", ""),
+                  "file":     r.get("path", ""),
+                  "line":     r.get("start", {}).get("line", ""),
+                  "message":  r.get("extra", {}).get("message", "")[:200],
+                })
+            except Exception as e:
+              print(f"Error {f}: {e}")
+
+          with open(f"{RESULTS_DIR}/sast_findings.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["version","rule_id","severity","file","line","message"])
+            w.writeheader()
+            w.writerows(sast_rows)
+          print(f"✅ SAST: {len(sast_rows)} findings → sast_findings.csv")
+
+          # --- SCA CSV ---
+          sca_rows = []
+          for f in sorted(glob.glob(f"{RESULTS_DIR}/v*_sca.json")):
+            version = os.path.basename(f).replace("_sca.json", "")
+            try:
+              d = json.load(open(f))
+              for r in d.get("results", []):
+                meta = r.get("extra", {}).get("metadata", {})
+                sca_rows.append({
+                  "version":          version,
+                  "cve":              meta.get("cve", ""),
+                  "severity":         r.get("extra", {}).get("severity", ""),
+                  "package":          meta.get("package", ""),
+                  "version_affected": meta.get("vulnerable_versions", ""),
+                  "file":             r.get("path", ""),
+                  "line":             r.get("start", {}).get("line", ""),
+                  "message":          r.get("extra", {}).get("message", "")[:200],
+                })
+            except Exception as e:
+              print(f"Error {f}: {e}")
+
+          with open(f"{RESULTS_DIR}/sca_findings.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["version","cve","severity","package","version_affected","file","line","message"])
+            w.writeheader()
+            w.writerows(sca_rows)
+          print(f"✅ SCA:  {len(sca_rows)} findings → sca_findings.csv")
+
+          # --- Summary CSV ---
+          summary_rows = []
+          versions = set()
+          for f in glob.glob(f"{RESULTS_DIR}/v*_sast.json"):
+            versions.add(os.path.basename(f).replace("_sast.json",""))
+
+          for version in sorted(versions):
+            sast_count = sca_total = cve_count = 0
+            try:
+              d = json.load(open(f"{RESULTS_DIR}/{version}_sast.json"))
+              sast_count = len(d.get("results", []))
+            except: pass
+            try:
+              d = json.load(open(f"{RESULTS_DIR}/{version}_sca.json"))
+              results = d.get("results", [])
+              sca_total = len(results)
+              cve_count = len([r for r in results if r.get("extra",{}).get("metadata",{}).get("cve","")])
+            except: pass
+
+            loc = loc_data.get(version, {}).get("total", 0)
+            density = round((sast_count / loc) * 1000, 4) if loc > 0 else 0
+            summary_rows.append({
+              "version":           version,
+              "loc_total":         loc,
+              "loc_typescript":    loc_data.get(version, {}).get("TypeScript", 0),
+              "loc_javascript":    loc_data.get(version, {}).get("JavaScript", 0),
+              "sast_findings":     sast_count,
+              "density_per_1kloc": density,
+              "sca_total":         sca_total,
+              "cve_count":         cve_count,
+            })
+
+          with open(f"{RESULTS_DIR}/summary.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["version","loc_total","loc_typescript","loc_javascript","sast_findings","density_per_1kloc","sca_total","cve_count"])
+            w.writeheader()
+            w.writerows(summary_rows)
+          print(f"✅ Summary: {len(summary_rows)} versions → summary.csv")
+
+          print()
+          print(f"{'Version':<12} {'LOC':>8} {'SAST':>6} {'Density':>10} {'SCA':>6} {'CVEs':>6}")
+          print("-" * 55)
+          for r in summary_rows:
+            print(f"{r['version']:<12} {r['loc_total']:>8,} {r['sast_findings']:>6} {r['density_per_1kloc']:>10.4f} {r['sca_total']:>6} {r['cve_count']:>6}")
+          PYEOF
