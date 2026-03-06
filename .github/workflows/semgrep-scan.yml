@@ -52,9 +52,9 @@ jobs:
         run: sudo apt-get install -y cloc
 
       # ===================================================
-      # STEP 4: SAST + SCA Scan แต่ละ version (command เดียว)
+      # STEP 4: SAST Scan แต่ละ version (semgrep scan)
       # ===================================================
-      - name: Run Semgrep scan
+      - name: Run SAST scan
         run: |
           mkdir -p results
           cd vue-core
@@ -66,7 +66,7 @@ jobs:
             COUNT=$((COUNT + 1))
             echo ""
             echo "==============================="
-            echo "[$COUNT/$TOTAL] Scanning $VERSION..."
+            echo "[$COUNT/$TOTAL] SAST Scanning $VERSION..."
             echo "==============================="
 
             git checkout "tags/$VERSION" -f 2>/dev/null || {
@@ -74,19 +74,14 @@ jobs:
               continue
             }
 
-            OUTPUT_FILE="../results/${VERSION}.json"
+            SAST_FILE="../results/${VERSION}_sast.json"
 
-            # SAST + SCA ใน command เดียว → ขึ้น Cloud UI ครบ
-            SEMGREP_BRANCH="release/$VERSION" \
-            SEMGREP_REPO_NAME="vuejs/core" \
-            SEMGREP_COMMIT="$VERSION" \
-            semgrep ci \
+            semgrep scan \
               --config "p/default" \
               --config "p/javascript" \
               --config "p/typescript" \
               --config "p/security-audit" \
               --config "p/owasp-top-ten" \
-              --supply-chain \
               --exclude="*__tests__*" \
               --exclude="*__mocks__*" \
               --exclude="*examples*" \
@@ -97,23 +92,72 @@ jobs:
               --include="*.js" \
               --include="*.vue" \
               --json \
-              --output "$OUTPUT_FILE" || true
+              --output "$SAST_FILE" || true
 
-            TOTAL_COUNT=$(python3 -c "
+            SAST_COUNT=$(python3 -c "
           import json
           try:
-            d = json.load(open('$OUTPUT_FILE'))
+            d = json.load(open('$SAST_FILE'))
+            print(len(d.get('results', [])))
+          except:
+            print('?')
+          ")
+            echo "SAST: $VERSION -> $SAST_COUNT findings"
+          done
+
+      # ===================================================
+      # STEP 5: SCA Scan แต่ละ version (semgrep ci)
+      # ===================================================
+      - name: Run SCA scan (Supply Chain / CVE)
+        run: |
+          cd vue-core
+
+          TOTAL=$(echo $VERSIONS | wc -w)
+          COUNT=0
+
+          for VERSION in $VERSIONS; do
+            COUNT=$((COUNT + 1))
+            echo ""
+            echo "==============================="
+            echo "[$COUNT/$TOTAL] SCA Scanning $VERSION..."
+            echo "==============================="
+
+            git checkout "tags/$VERSION" -f 2>/dev/null || {
+              echo "Tag $VERSION not found, skipping..."
+              continue
+            }
+
+            SCA_FILE="../results/${VERSION}_sca.json"
+
+            SEMGREP_BRANCH="release/$VERSION" \
+            SEMGREP_REPO_NAME="vuejs/core" \
+            SEMGREP_COMMIT="$VERSION" \
+            semgrep ci \
+              --supply-chain \
+              --exclude="*__tests__*" \
+              --exclude="*__mocks__*" \
+              --exclude="*examples*" \
+              --exclude="*size-check*" \
+              --exclude="*template-explorer*" \
+              --exclude="*runtime-test*" \
+              --json \
+              --output "$SCA_FILE" || true
+
+            SCA_COUNT=$(python3 -c "
+          import json
+          try:
+            d = json.load(open('$SCA_FILE'))
             results = d.get('results', [])
             cve_list = [r for r in results if r.get('extra',{}).get('metadata',{}).get('cve','')]
             print(f'total={len(results)} cve={len(cve_list)}')
           except:
             print('?')
           ")
-            echo "Done: $VERSION -> $TOTAL_COUNT"
+            echo "SCA: $VERSION -> $SCA_COUNT"
           done
 
       # ===================================================
-      # STEP 5: Count LOC with cloc
+      # STEP 6: Count LOC with cloc
       # ===================================================
       - name: Count LOC per version
         run: |
@@ -151,7 +195,7 @@ jobs:
           echo "}" >> ../results/loc_summary.json
 
       # ===================================================
-      # STEP 6: Generate summary
+      # STEP 7: Generate summary
       # ===================================================
       - name: Generate summary
         run: |
@@ -164,25 +208,38 @@ jobs:
           except:
             pass
 
-          print('\n=== Scan Summary ===')
-          print(f\"{'Version':<12} {'LOC':>8} {'Total':>8} {'CVEs':>6} {'Density/1KLOC':>15}\")
-          print('-' * 55)
+          print('\n=== SAST Summary ===')
+          print(f\"{'Version':<12} {'LOC':>8} {'Findings':>10} {'Density/1KLOC':>15}\")
+          print('-' * 50)
 
-          for f in sorted(glob.glob('results/v*.json')):
-            version = os.path.basename(f).replace('.json','')
+          for f in sorted(glob.glob('results/v*_sast.json')):
+            version = os.path.basename(f).replace('_sast.json','')
+            try:
+              d = json.load(open(f))
+              findings = len(d.get('results', []))
+              loc = loc_data.get(version, {}).get('total', 0)
+              density = round((findings / loc) * 1000, 4) if loc > 0 else 0
+              print(f'{version:<12} {loc:>8,} {findings:>10} {density:>15.4f}')
+            except Exception as e:
+              print(f'{version:<12} error: {e}')
+
+          print('\n=== Supply Chain (CVE) Summary ===')
+          print(f\"{'Version':<12} {'SCA Total':>10} {'CVEs':>8}\")
+          print('-' * 35)
+
+          for f in sorted(glob.glob('results/v*_sca.json')):
+            version = os.path.basename(f).replace('_sca.json','')
             try:
               d = json.load(open(f))
               results = d.get('results', [])
               cve_list = [r for r in results if r.get('extra',{}).get('metadata',{}).get('cve','')]
-              loc = loc_data.get(version, {}).get('total', 0)
-              density = round((len(results) / loc) * 1000, 4) if loc > 0 else 0
-              print(f'{version:<12} {loc:>8,} {len(results):>8} {len(cve_list):>6} {density:>15.4f}')
+              print(f'{version:<12} {len(results):>10} {len(cve_list):>8}')
             except Exception as e:
               print(f'{version:<12} error: {e}')
           "
 
       # ===================================================
-      # STEP 7: Upload results as Artifacts
+      # STEP 8: Upload results as Artifacts
       # ===================================================
       - name: Upload scan results
         uses: actions/upload-artifact@v4
